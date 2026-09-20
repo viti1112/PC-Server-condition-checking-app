@@ -1,82 +1,21 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+const platform = switch (builtin.os.tag) {
+    .linux => @import("platform_linux.zig"),
+    .windows => @import("platform_windows.zig"),
+    else => @compileError("unsupported OS: only Linux and Windows are supported"),
+};
 
 const host = ""; // your ssh host here
 const interval_seconds = 30;
 
 const Report = struct {
     uptime_seconds: f64,
-    mem_available_kb: u32,
+    mem_available_kb: u64,
 };
 
-const CpuTicks = struct {
-    idle: u64,
-    total: u64,
-};
-
-fn readUptime(io: std.Io, allocator: std.mem.Allocator) !f64 {
-    const file = try std.Io.Dir.openFileAbsolute(io, "/proc/uptime", .{});
-    defer file.close(io);
-
-    var file_buffer: [1024]u8 = undefined;
-    var reader = file.readerStreaming(io, &file_buffer);
-    const contents = try reader.interface.allocRemaining(allocator, .unlimited);
-    defer allocator.free(contents);
-
-    var fields = std.mem.tokenizeScalar(u8, contents, ' ');
-    const uptime_str = fields.next() orelse return error.ParseFailed;
-    return std.fmt.parseFloat(f64, uptime_str);
-}
-
-fn readMemAvailableKb(io: std.Io, allocator: std.mem.Allocator) !u32 {
-    const file = try std.Io.Dir.openFileAbsolute(io, "/proc/meminfo", .{});
-    defer file.close(io);
-
-    var file_buffer: [4096]u8 = undefined;
-    var reader = file.readerStreaming(io, &file_buffer);
-    const contents = try reader.interface.allocRemaining(allocator, .unlimited);
-    defer allocator.free(contents);
-
-    var lines = std.mem.tokenizeScalar(u8, contents, '\n');
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, "MemAvailable:")) {
-            var fields = std.mem.tokenizeScalar(u8, line, ' ');
-            _ = fields.next(); // skip "MemAvailable:"
-            const value_str = fields.next() orelse return error.ParseFailed;
-            return std.fmt.parseInt(u32, value_str, 10);
-        }
-    }
-    return error.ParseFailed;
-}
-
-fn readCpuTicks(io: std.Io, allocator: std.mem.Allocator) !CpuTicks {
-    const file = try std.Io.Dir.openFileAbsolute(io, "/proc/stat", .{});
-    defer file.close(io);
-
-    var file_buffer: [1024]u8 = undefined;
-    var reader = file.readerStreaming(io, &file_buffer);
-    const contents = try reader.interface.allocRemaining(allocator, .unlimited);
-    defer allocator.free(contents);
-
-    var lines = std.mem.tokenizeScalar(u8, contents, '\n');
-    const cpu_line = lines.next() orelse return error.ParseFailed;
-
-    var fields = std.mem.tokenizeScalar(u8, cpu_line, ' ');
-    _ = fields.next();
-
-    var total: u64 = 0;
-    var idle: u64 = 0;
-    var field_index: u8 = 0;
-    while (fields.next()) |field_str| {
-        const value = try std.fmt.parseInt(u64, field_str, 10);
-        total += value;
-        if (field_index == 3) idle = value;
-        field_index += 1;
-    }
-
-    return CpuTicks{ .idle = idle, .total = total };
-}
-
-fn cpuPercent(prev: CpuTicks, curr: CpuTicks) f64 {
+fn cpuPercent(prev: platform.CpuTicks, curr: platform.CpuTicks) f64 {
     const total_delta: f64 = @floatFromInt(curr.total - prev.total);
     const idle_delta: f64 = @floatFromInt(curr.idle - prev.idle);
     if (total_delta == 0) return 0;
@@ -85,8 +24,8 @@ fn cpuPercent(prev: CpuTicks, curr: CpuTicks) f64 {
 
 fn collectReport(io: std.Io, allocator: std.mem.Allocator) !Report {
     return Report{
-        .uptime_seconds = try readUptime(io, allocator),
-        .mem_available_kb = try readMemAvailableKb(io, allocator),
+        .uptime_seconds = try platform.readUptime(io, allocator),
+        .mem_available_kb = try platform.readMemAvailableKb(io, allocator),
     };
 }
 
@@ -152,11 +91,15 @@ pub fn main(init: std.process.Init) !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var prev_ticks = try readCpuTicks(io, allocator);
+    var prev_ticks = try platform.readCpuTicks(io, allocator);
 
     while (true) {
-        const curr_ticks = readCpuTicks(io, allocator) catch |err| {
-            std.debug.print("failed to read /proc/stat: {}\n", .{err});
+        // Sleep first so the CPU delta spans a full interval and a failing
+        // iteration (`continue`) cannot spin the loop.
+        try io.sleep(.fromNanoseconds(interval_seconds * std.time.ns_per_s), .awake);
+
+        const curr_ticks = platform.readCpuTicks(io, allocator) catch |err| {
+            std.debug.print("failed to read cpu stats: {}\n", .{err});
             continue;
         };
         const cpu_percent = cpuPercent(prev_ticks, curr_ticks);
@@ -174,7 +117,5 @@ pub fn main(init: std.process.Init) !void {
         defer allocator.free(text);
 
         sendWithRetry(io, allocator, text, host, 3);
-
-        try io.sleep(.fromNanoseconds(interval_seconds * std.time.ns_per_s), .awake);
     }
 }
